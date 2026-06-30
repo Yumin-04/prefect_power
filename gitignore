@@ -1,0 +1,22 @@
+# 데이터 파일 (Kaggle에서 직접 다운로드)
+powerconsumption.csv
+*.csv
+
+# 실행 결과물 (매번 새로 생성됨)
+output/
+*.parquet
+
+# Python 관련
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Prefect 관련 (로컬 서버 캐시/DB)
+.prefect/
+*.db
+
+# OS/에디터 관련
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,3 @@
+prefect>=2.19
+pandas>=2.0
+pyarrow>=14.0
