@@ -1,184 +1,594 @@
-# Power Consumption ETL with Prefect
+﻿# Power Consumption ETL - Validate & Transform
 
-Kaggle "Power Consumption of Tetouan City" 데이터셋(10분 간격, 기상변수 + 3개 구역 전력소비량)을
-정제하는 Prefect ETL 파이프라인입니다.
+Kaggle `Power Consumption of Tetouan City` 데이터셋을 분석 가능한 형태로 정제하기 위한 전처리 문서입니다. 이 문서는 파이프라인 전체 설명이 아니라, **validate**와 **transform** 단계만 구체적으로 설명합니다.
 
-## 파일 구성
+이 전처리는 파생 피처 생성(feature engineering)을 하지 않습니다. 시간 변수, lag/rolling, zone 비중, 모델 입력용 스케일링 등은 별도 단계에서 수행하고, 여기서는 원본 데이터의 품질을 검증하고 분석 가능한 시계열 테이블로 정리하는 데 집중합니다.
 
-- `etl_flow.py` : ETL 메인 플로우 (extract → validate → transform → load)
-- `deploy.py` : 정기 스케줄링(cron) 배포 등록 예시 코드
-- `requirements.txt` : 의존성 목록
-- `HOW_TO_USE_ON_OTHER_MACHINE.md` : 다른 컴퓨터에서 이 레포를 clone해서 실행하는 방법 안내
+## Dataset Grain
 
-## 데이터 준비 (필수)
+원본 데이터는 하나의 CSV 파일이며, 한 행은 하나의 10분 관측 시점입니다.
 
-이 레포에는 데이터 파일(`powerconsumption.csv`)이 포함되어 있지 않습니다.
-아래 Kaggle 데이터셋을 직접 다운로드한 뒤, 이 README와 같은 폴더에
-`powerconsumption.csv` 라는 이름으로 넣어주세요.
-
-- Kaggle: "Electric Power Consumption" 데이터셋 검색 후 다운로드
-- 파일을 받으면 프로젝트 루트 폴더(이 파일들과 같은 위치)에 복사
-
-폴더 구조 예시:
-```
-prefect_power/
-├── etl_flow.py
-├── deploy.py
-├── requirements.txt
-├── README.md
-└── powerconsumption.csv   <- 직접 다운로드해서 추가
-```
-
-## 데이터 설명
-
-모로코 북부, 지중해 연안에 위치한 테투안(Tetouan)시의 3개 배전망(distribution network)에 대한 전력소비량 데이터입니다. 2017년 1월 1일부터 12월 30일까지 10분 간격으로 수집되었으며, 총 52,416개 관측치로 구성되어 있습니다.
-
-| 컬럼 | 설명 |
+| 항목 | 값 |
 | --- | --- |
-| `Datetime` | 10분 단위 시간 창(timestamp) |
-| `Temperature` | 기온 |
-| `Humidity` | 습도 (%) |
-| `WindSpeed` | 풍속 |
-| `GeneralDiffuseFlows` | 일반 확산 일사량 |
-| `DiffuseFlows` | 확산 일사량 |
-| `PowerConsumption_Zone1` | 1구역 전력소비량 |
-| `PowerConsumption_Zone2` | 2구역 전력소비량 |
-| `PowerConsumption_Zone3` | 3구역 전력소비량 |
+| 파일 | `powerconsumption.csv` |
+| 행 수 | 52,416 |
+| 기간 | `2017-01-01 00:00:00` ~ `2017-12-30 23:50:00` |
+| 간격 | 10분 |
+| 하루 정상 행 수 | 144 |
+| 시간 컬럼 | `Datetime` |
+| 수치 컬럼 | 기상 5개 + 전력 소비 3개 |
+| 타깃 후보 | `PowerConsumption_Zone1`, `PowerConsumption_Zone2`, `PowerConsumption_Zone3` |
 
-지중해성 기후 특성상 겨울엔 온화하고 비가 오며 여름엔 덥고 건조한데, 이 계절적 기상 패턴이 냉난방 수요를 통해 전력소비량과 강하게 연동되는 경향이 있습니다. 일사량 컬럼(`GeneralDiffuseFlows`, `DiffuseFlows`)은 낮 동안에는 값이 크고 밤에는 0에 가까운 일중 패턴을 보이는데, validate 단계에서 이 패턴이 통계적 이상치(IQR)로 일부 잡히는 것도 이 때문입니다.
+컬럼 구성:
 
-## 파이프라인 단계
+| 컬럼 | 역할 | 원본 기준 min | 원본 기준 max | 비고 |
+| --- | --- | ---: | ---: | --- |
+| `Datetime` | timestamp | - | - | `%m/%d/%Y %H:%M` 형식 |
+| `Temperature` | weather | 3.247 | 40.010 | 기온 |
+| `Humidity` | weather | 11.340 | 94.800 | 습도 |
+| `WindSpeed` | weather | 0.050 | 6.483 | 풍속 |
+| `GeneralDiffuseFlows` | weather | 0.004 | 1163.000 | 일반 확산 일사량 |
+| `DiffuseFlows` | weather | 0.011 | 936.000 | 확산 일사량 |
+| `PowerConsumption_Zone1` | target candidate | 13895.696 | 52204.395 | 1구역 전력 소비 |
+| `PowerConsumption_Zone2` | target candidate | 8560.081 | 37408.861 | 2구역 전력 소비 |
+| `PowerConsumption_Zone3` | target candidate | 5935.174 | 47598.326 | 3구역 전력 소비 |
 
-### 1. extract
-원본 CSV 로드 (재시도 2회 포함)
+원본 파일 사전 점검 결과:
 
-### 2. validate
+| 점검 항목 | 결과 |
+| --- | --- |
+| 결측치 | 없음 |
+| 완전 중복 행 | 없음 |
+| 중복 `Datetime` | 없음 |
+| 시간 정렬 | 정렬됨 |
+| 시간 간격 | 전체 10분 간격 유지 |
+| 하루 144개 미만/초과 날짜 | 없음 |
+| 음수값 | 없음 |
+| 물리 범위 초과값 | 없음 |
+| critical issue | 없음 |
 
-[#validate](#validate)
+## Validate
 
-`validate(df, strict=False)` 함수가 담당합니다. 문제를 **critical**(심각)과 **warning**(경미)으로 구분해 `dict` 리포트로 반환하며, `strict=True`(CLI `--strict`) 시 critical 이슈가 하나라도 있으면 파이프라인을 중단시킵니다.
+`validate(df, strict=False)`는 원본 DataFrame을 수정하지 않고 품질 검증 리포트만 생성합니다. 리포트는 `critical_issues`, `warnings`, 세부 지표를 담은 dict입니다.
 
-1. **스키마 확인** — `expected_cols - set(df.columns)`로 필수 컬럼 누락 여부를 확인. 누락 시 이후 검증이 무의미하므로 strict 여부와 무관하게 즉시 중단.
-2. **타입 검증** — `NUMERIC_COLS_EXPECTED`의 각 컬럼을 `pd.api.types.is_numeric_dtype()`으로 확인하고, 아니라면 `pd.to_numeric(errors="coerce")`로 강제 변환해 새로 생긴 결측치 개수(`dtype_issues`)를 셈.
-3. **Datetime 파싱** — `pd.to_datetime(errors="coerce")`로 파싱 실패 건수(`unparsable_datetime_count`)를 집계.
-4. **중복 / 충돌 레코드 검사**
-   - 전체 행 완전 중복 → `duplicate_rows`
-   - Datetime 값만 중복 → `duplicate_datetime_count`
-   - **충돌 레코드**: Datetime은 같은데 나머지 값이 다른 경우 → `conflicting_datetime_count` (단순 중복보다 심각, critical)
-5. **결측치** — 컬럼별 개수(`null_counts`)와 비율을 집계하고, **30% 초과** 컬럼은 `high_null_cols`로 잡아 critical 처리.
-6. **음수값** — `Datetime`을 제외한 전 컬럼에서 음수 개수(`negative_value_counts`) 집계 (warning).
-7. **물리적 유효 범위 검증** — 컬럼별 상식적 범위(`VALID_RANGES`)를 벗어난 값 탐지:
+`strict=True` 또는 CLI `--strict` 사용 시 critical issue가 하나라도 있으면 transform/load로 넘어가지 않고 파이프라인을 중단합니다.
 
-   | 컬럼 | 유효 범위 |
-   | --- | --- |
-   | Temperature | -30 ~ 55 (℃) |
-   | Humidity | 0 ~ 100 (%) |
-   | WindSpeed | 0 ~ 60 (m/s) |
-   | GeneralDiffuseFlows / DiffuseFlows | 0 ~ 1500 (W/m²) |
-   | PowerConsumption_Zone1/2/3 | 0 ~ 100,000 |
+### Severity Policy
 
-   범위를 벗어난 개수·실제 min/max를 `out_of_range_values`에 기록 (warning).
-8. **통계적 이상치 탐지 (IQR)** — 컬럼별 `q1`, `q3`로 `iqr = q3 - q1`을 구해 `[q1 - 3·iqr, q3 + 3·iqr]` 범위를 벗어나는 값을 `statistical_outliers`에 기록. 일반적인 1.5×IQR보다 관대한 **3×IQR**을 써서 정상적인 계절/일중 변동을 오탐하지 않도록 함 (warning).
-9. **시간 정렬 여부** — `is_monotonic_increasing`으로 확인 (`is_time_sorted`); 정렬 안 되어 있으면 warning만 남기고 transform에서 자동 정렬.
-10. **시간 간격 연속성** — 정렬된 Datetime의 `diff()`를 10분 간격 기준과 비교해 불규칙 구간(`irregular_interval_count`)을 집계하고, 그중 **30분(3배) 이상** 벌어진 큰 갭은 `large_gap_count`로 별도 표기 (데이터 통째 누락 가능성).
+| 등급 | 의미 | 예시 | strict 모드 동작 |
+| --- | --- | --- | --- |
+| `critical` | 이후 처리 결과를 신뢰하기 어려운 문제 | 필수 컬럼 누락, Datetime 파싱 실패, 충돌 레코드, 과도한 결측 | 중단 |
+| `warning` | 자동 정제 가능하거나 분석자가 확인할 문제 | 정렬 안 됨, IQR 이상치, 일부 범위 초과값, 짧은 결측 | 계속 진행 가능 |
 
-**반환되는 report 예시:**
+필수 컬럼 누락은 `strict` 값과 무관하게 즉시 중단합니다. 스키마가 깨지면 이후 검증 항목 대부분이 의미 없어지기 때문입니다.
+
+### 1. Schema Validation
+
+필수 컬럼이 모두 존재하는지 확인합니다.
+
+```python
+EXPECTED_COLS = {
+    "Datetime",
+    "Temperature",
+    "Humidity",
+    "WindSpeed",
+    "GeneralDiffuseFlows",
+    "DiffuseFlows",
+    "PowerConsumption_Zone1",
+    "PowerConsumption_Zone2",
+    "PowerConsumption_Zone3",
+}
+
+missing_cols = EXPECTED_COLS - set(df.columns)
+```
+
+판정:
+
+| 조건 | 리포트 | 등급 |
+| --- | --- | --- |
+| `missing_cols`가 비어 있음 | 정상 | - |
+| 필수 컬럼 누락 | `critical_issues`, `missing_columns` | critical |
+| 예상 외 컬럼 존재 | `extra_columns` | warning 또는 info |
+
+### 2. Numeric Type Validation
+
+`Datetime`을 제외한 모든 컬럼은 숫자형이어야 합니다.
+
+```python
+NUMERIC_COLS_EXPECTED = [
+    "Temperature",
+    "Humidity",
+    "WindSpeed",
+    "GeneralDiffuseFlows",
+    "DiffuseFlows",
+    "PowerConsumption_Zone1",
+    "PowerConsumption_Zone2",
+    "PowerConsumption_Zone3",
+]
+```
+
+각 컬럼에 대해 `pd.api.types.is_numeric_dtype()`로 확인합니다. 숫자형이 아니면 검증용 복사본에서만 다음 변환을 시도합니다.
+
+```python
+converted = pd.to_numeric(df[col], errors="coerce")
+new_nulls = converted.isna().sum() - df[col].isna().sum()
+```
+
+판정:
+
+| 조건 | 리포트 | 등급 |
+| --- | --- | --- |
+| 이미 숫자형 | 정상 | - |
+| 변환 가능하지만 dtype이 object | `dtype_issues[col] = new_nulls` | warning |
+| 변환 불가능 값으로 결측 발생 | `dtype_issues[col] > 0` | warning 또는 critical |
+| 전력 컬럼에서 변환 실패 다수 | `critical_issues` | critical |
+
+validate 단계에서는 원본 `df`를 직접 바꾸지 않습니다. 실제 변환은 transform에서 수행합니다.
+
+### 3. Datetime Parsing Validation
+
+`Datetime`은 시간축의 기준이므로 가장 중요한 컬럼입니다. 이 데이터셋의 원본 형식은 `1/1/2017 0:00` 형태입니다.
+
+```python
+parsed_dt = pd.to_datetime(
+    df["Datetime"],
+    format="%m/%d/%Y %H:%M",
+    errors="coerce",
+)
+```
+
+리포트 항목:
+
+| 항목 | 의미 |
+| --- | --- |
+| `unparsable_datetime_count` | 파싱 실패로 `NaT`가 된 행 수 |
+| `time_range` | 파싱 가능한 Datetime의 min/max |
+| `row_count` | 전체 행 수 |
+
+판정:
+
+| 조건 | 등급 |
+| --- | --- |
+| 파싱 실패 0건 | 정상 |
+| 파싱 실패 1건 이상 | critical |
+
+Datetime 파싱 실패 행은 시간 위치를 알 수 없어 안전하게 보간할 수 없습니다.
+
+### 4. Duplicate & Conflict Validation
+
+중복은 세 단계로 나눠 봅니다.
+
+| 검사 | 기준 | 리포트 |
+| --- | --- | --- |
+| 완전 중복 | 모든 컬럼 값이 동일 | `duplicate_rows` |
+| Datetime 중복 | 같은 시각이 2번 이상 등장 | `duplicate_datetime_count` |
+| 충돌 레코드 | 같은 시각인데 나머지 값이 다름 | `conflicting_datetime_count` |
+
+충돌 레코드 예시:
+
+```text
+Datetime           Temperature  ...  PowerConsumption_Zone1
+2017-01-01 00:00   6.559        ...  34055.6962
+2017-01-01 00:00   7.100        ...  35000.0000
+```
+
+판정:
+
+| 조건 | 등급 | 이유 |
+| --- | --- | --- |
+| 완전 중복 | warning | 제거 가능 |
+| Datetime 중복이지만 값 동일 | warning | 중복 제거 가능 |
+| Datetime 중복 + 값 다름 | critical | 같은 시각의 참값이 불명확 |
+
+transform에서는 같은 시각의 여러 값이 있으면 평균 병합할 수 있지만, 충돌 자체는 반드시 리포트에 남깁니다.
+
+### 5. Null Validation
+
+컬럼별 결측 개수와 비율을 계산합니다.
+
+```python
+null_counts = df.isna().sum()
+null_ratios = df.isna().mean()
+```
+
+판정 기준:
+
+| 컬럼 그룹 | 기준 | 등급 |
+| --- | --- | --- |
+| `Datetime` | 결측 또는 파싱 실패 1건 이상 | critical |
+| `PowerConsumption_Zone1/2/3` | 결측률 5~10% 이상 | critical 또는 strong warning |
+| weather columns | 결측률 30% 초과 | critical |
+| any column | 소량 결측 | warning |
+
+전력 컬럼은 분석 대상이므로 기상 컬럼보다 더 엄격하게 판단합니다.
+
+### 6. Negative Value Validation
+
+`Datetime`을 제외한 수치 컬럼의 음수 개수를 계산합니다.
+
+```python
+negative_value_counts[col] = (df[col] < 0).sum()
+```
+
+판정:
+
+| 컬럼 | 음수 허용 여부 | 등급 |
+| --- | --- | --- |
+| `Temperature` | 가능 | 물리 범위에서 판단 |
+| `Humidity` | 불가 | warning 또는 critical |
+| `WindSpeed` | 불가 | warning 또는 critical |
+| `GeneralDiffuseFlows` | 불가 | warning 또는 critical |
+| `DiffuseFlows` | 불가 | warning 또는 critical |
+| `PowerConsumption_Zone1/2/3` | 불가 | critical에 가까운 warning |
+
+이 데이터셋 원본에는 음수값이 없습니다.
+
+### 7. Physical Range Validation
+
+실제 원본 범위보다 넉넉한 유효 범위를 둡니다. 목적은 정상적인 계절/일중 변동을 제거하는 것이 아니라, 물리적으로 불가능하거나 단위가 잘못된 값을 잡는 것입니다.
+
+```python
+VALID_RANGES = {
+    "Temperature": (-30, 55),
+    "Humidity": (0, 100),
+    "WindSpeed": (0, 60),
+    "GeneralDiffuseFlows": (0, 1500),
+    "DiffuseFlows": (0, 1500),
+    "PowerConsumption_Zone1": (0, 100000),
+    "PowerConsumption_Zone2": (0, 100000),
+    "PowerConsumption_Zone3": (0, 100000),
+}
+```
+
+리포트:
+
+```json
+"out_of_range_values": {
+  "Humidity": {
+    "count": 3,
+    "min": -5.0,
+    "max": 103.2,
+    "valid_min": 0,
+    "valid_max": 100
+  }
+}
+```
+
+판정:
+
+| 조건 | 등급 |
+| --- | --- |
+| 범위 초과 없음 | 정상 |
+| 소량 범위 초과 | warning |
+| 특정 컬럼 대부분 범위 초과 | critical 가능 |
+
+### 8. Statistical Outlier Validation
+
+IQR 기반 이상치를 탐지합니다.
+
+```python
+q1 = df[col].quantile(0.25)
+q3 = df[col].quantile(0.75)
+iqr = q3 - q1
+lower = q1 - 3 * iqr
+upper = q3 + 3 * iqr
+```
+
+`1.5 * IQR`이 아니라 `3 * IQR`을 사용합니다. 이 데이터는 일사량과 전력 소비가 낮/밤, 계절, 온도에 따라 크게 움직이기 때문에 일반적인 IQR 기준을 쓰면 정상 피크를 과하게 잡을 수 있습니다.
+
+리포트:
+
+```json
+"statistical_outliers": {
+  "DiffuseFlows": {
+    "count": 1690,
+    "ratio": 0.0322,
+    "lower": -302.51,
+    "upper": 403.63
+  }
+}
+```
+
+판정:
+
+| 조건 | 등급 | transform 처리 |
+| --- | --- | --- |
+| IQR 이상치 발견 | warning | 자동 수정하지 않음 |
+
+특히 `GeneralDiffuseFlows`, `DiffuseFlows`는 밤에는 거의 0이고 낮에는 크게 증가하므로 IQR 이상치가 곧 데이터 오류는 아닙니다.
+
+### 9. Time Order Validation
+
+파싱된 `Datetime`이 오름차순인지 확인합니다.
+
+```python
+is_time_sorted = parsed_dt.is_monotonic_increasing
+```
+
+판정:
+
+| 조건 | 등급 | transform 처리 |
+| --- | --- | --- |
+| 정렬됨 | 정상 | 유지 |
+| 정렬 안 됨 | warning | `Datetime` 기준 정렬 |
+
+### 10. Time Interval Validation
+
+10분 간격 시계열이므로 시간 간격 검증이 중요합니다.
+
+```python
+diffs = parsed_dt.sort_values().diff()
+irregular_interval_count = (diffs.dropna() != pd.Timedelta(minutes=10)).sum()
+large_gap_count = (diffs.dropna() >= pd.Timedelta(minutes=30)).sum()
+```
+
+리포트:
+
+| 항목 | 의미 |
+| --- | --- |
+| `irregular_interval_count` | 10분이 아닌 간격 수 |
+| `large_gap_count` | 30분 이상 벌어진 구간 수 |
+| `incomplete_daily_counts` | 하루 144개가 아닌 날짜 목록 |
+
+판정:
+
+| 조건 | 등급 | 이유 |
+| --- | --- | --- |
+| 10분 간격 유지 | 정상 | 원본처럼 연속 시계열 |
+| 짧은 누락 | warning | reindex 후 보간 가능 |
+| 30분 이상 큰 갭 | warning 또는 critical | 자동 보간 시 왜곡 가능 |
+
+### Validate Report Shape
+
+`validate()`는 아래 형태의 dict를 반환합니다.
+
 ```json
 {
   "critical_issues": [],
   "warnings": [],
   "row_count": 52416,
+  "missing_columns": [],
+  "extra_columns": [],
   "dtype_issues": {},
   "unparsable_datetime_count": 0,
   "duplicate_rows": 0,
   "duplicate_datetime_count": 0,
   "conflicting_datetime_count": 0,
   "null_counts": {},
+  "null_ratios": {},
+  "high_null_cols": [],
   "negative_value_counts": {},
   "out_of_range_values": {},
   "statistical_outliers": {
-    "DiffuseFlows": { "count": 1690, "ratio": 0.0322 }
+    "DiffuseFlows": {
+      "count": 1690,
+      "ratio": 0.0322
+    }
   },
   "is_time_sorted": true,
   "irregular_interval_count": 0,
   "large_gap_count": 0,
-  "time_range": ["2017-01-01 00:00:00", "2017-12-30 23:50:00"],
+  "incomplete_daily_counts": {},
+  "time_range": [
+    "2017-01-01 00:00:00",
+    "2017-12-30 23:50:00"
+  ],
   "is_valid": true
 }
 ```
 
-### 3. transform
+## Transform
 
-[#transform](#transform)
+`transform(df)`는 validate에서 점검한 문제에 대응해 데이터를 정제합니다. 이 단계의 출력은 여전히 **한 행 = 10분 관측 시점**인 테이블입니다. 행의 의미를 바꾸는 집계나 모델용 파생 피처 생성은 하지 않습니다.
 
-`transform(df)` 함수가 담당하며, validate 단계에서 점검한 항목들과 최대한 1:1로 대응되도록 구성되어 있습니다.
+### Transform Contract
 
-1. **타입 정제** — `NUMERIC_COLS_EXPECTED` 중 숫자형이 아닌 컬럼을 `pd.to_numeric(errors="coerce")`로 강제 변환 (validate의 **타입 검증**에 대응).
-2. **Datetime 정제** — `pd.to_datetime(errors="coerce")`로 다시 파싱하고, 파싱 실패(`NaT`)인 행은 시간축 자체가 없어 보간이 불가능하므로 제거 (validate의 **Datetime 파싱 검증**에 대응).
-3. **중복/충돌 레코드 정제** — 같은 시각(`Datetime`)에 여러 레코드가 있으면 완전 중복이든 값이 다른 충돌이든 구분하지 않고 `groupby("Datetime").mean()`으로 평균 집계해 시각당 하나의 레코드로 병합 (validate의 **중복/충돌 검사**에 대응).
-4. **정렬** — 시각순으로 정렬 (validate의 **시간 정렬 여부**에 대응).
-5. **범위 기반 정제** — validate와 동일한 `VALID_RANGES` 기준으로 물리적으로 불가능한 값을 `NaN`으로 치환. 음수값도 대부분 컬럼에서 하한이 0이므로 이 단계에서 자연스럽게 함께 처리됨 (validate의 **물리적 유효 범위 검증**, **음수값 검사**에 대응).
-6. **결측치 보간** — 원래 결측치와 5)에서 새로 생긴 결측치를 모두 `interpolate(method="linear", limit_direction="both")`로 시간 기준 선형 보간 (validate의 **결측치 검사**에 대응).
+| 항목 | 내용 |
+| --- | --- |
+| 입력 | raw pandas DataFrame |
+| 출력 | cleaned pandas DataFrame |
+| grain | one row = one 10-minute timestamp |
+| index | `Datetime` 기준 정렬된 시계열 |
+| 포함 | 타입 변환, Datetime 파싱, 중복 처리, 정렬, reindex, 범위 밖 값 치환, 짧은 결측 보간 |
+| 제외 | 시간 파생 변수, lag/rolling, 스케일링, 타깃 선택, train/test split |
 
-> `statistical_outliers`(IQR)와 `irregular_interval_count`/`large_gap_count`는 정상적인 자연 변동(일사량의 일중 패턴, 계절적 수요 변화, 실측 장비 특성 등)일 수 있어 transform 단계에서 임의로 수정하지 않고 quality_report에만 남겨 참고용으로 둡니다.
+### 1. Numeric Type Cleaning
 
-### 4. load
+validate에서 숫자형이 아니라고 판단된 컬럼을 실제로 숫자형으로 변환합니다.
 
-[#load](#load)
-
-정제 데이터를 parquet + csv로 저장하고, 품질 리포트(JSON)를 저장하며, Prefect UI에 마크다운 아티팩트를 생성합니다 (PASS/FAIL 종합 판정 및 critical/warning 목록 포함).
-
-## 로컬 실행
-
-```bash
-pip install -r requirements.txt
-
-python etl_flow.py --input powerconsumption.csv --outdir ./output
-
-# critical 품질 이슈 발견 시 파이프라인을 중단시키고 싶다면
-python etl_flow.py --input powerconsumption.csv --outdir ./output --strict
+```python
+for col in NUMERIC_COLS_EXPECTED:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
 ```
 
-실행 후 `./output/` 디렉토리에 아래 파일이 생성됩니다.
+변환할 수 없는 값은 `NaN`이 됩니다. 이 결측은 이후 보간 대상입니다.
 
-- `powerconsumption_clean.parquet`
-- `powerconsumption_clean.csv`
-- `quality_report.json`
+### 2. Datetime Cleaning
 
-Prefect UI를 함께 보고 싶다면 별도 터미널에서 `prefect server start` 실행 후
-`http://127.0.0.1:4200` 에서 플로우 실행 기록과 아티팩트를 확인할 수 있습니다.
+`Datetime`을 명시적 format으로 파싱합니다.
 
-## 정기 스케줄 배포 (선택)
-
-매일 자동 실행되도록 등록하려면:
-
-```bash
-# 1) Prefect 서버 또는 Cloud 연결
-prefect server start            # 로컬 서버
-# 또는: prefect cloud login
-
-# 2) 워크풀 생성 (최초 1회)
-prefect work-pool create my-process-pool --type process
-
-# 3) 배포 등록 (매일 새벽 1시 cron)
-python deploy.py
-
-# 4) 워커 실행 (실제로 작업을 수행)
-prefect worker start --pool my-process-pool
+```python
+df["Datetime"] = pd.to_datetime(
+    df["Datetime"],
+    format="%m/%d/%Y %H:%M",
+    errors="coerce",
+)
 ```
 
-`deploy.py`의 `cron` 값이나 `parameters`는 필요에 맞게 수정하면 됩니다.
+파싱 실패 행은 제거합니다.
 
-## 참고: 데이터 사전 점검 결과 (제공된 파일 기준)
+```python
+df = df.dropna(subset=["Datetime"])
+```
 
-- 행 수: 52,416 (2017-01-01 ~ 2017-12-30, 10분 간격)
-- 결측치: 없음
-- 중복 행 / 중복 Datetime: 없음
-- 음수값: 없음
-- 물리적 유효 범위 이탈: 없음
-- 시간 간격: 전 구간 10분 간격으로 끊김 없음, 시간순 정렬됨
-- 종합 판정: `is_valid: true` (critical issue 없음)
-- 참고용 경고: `DiffuseFlows` 컬럼에서 IQR 기준 통계적 이상치 1,690건(약 3.2%) 발견 — 이는 데이터 오류가 아니라 야간에 일사량이 0에 가깝고 낮에 급증하는 자연스러운 패턴이라 정상적인 현상임
+이유:
 
-다만 ETL 코드는 위와 다른(결측/중복/음수/간격 불규칙/범위 이탈이 있는) 데이터가 들어와도
-안전하게 처리되도록 일반화해서 작성했습니다.
+| 문제 | 처리 |
+| --- | --- |
+| Datetime 파싱 실패 | 행 제거 |
+| 수치값 결측 | 보간 가능 |
+
+수치값 결측은 앞뒤 시간값으로 추정할 수 있지만, 시간값 자체가 없으면 어느 위치에 들어가야 하는지 알 수 없습니다.
+
+### 3. Duplicate & Conflict Cleaning
+
+먼저 완전 중복을 제거합니다.
+
+```python
+df = df.drop_duplicates()
+```
+
+이후 같은 `Datetime`에 여러 행이 있으면 하나로 병합합니다.
+
+```python
+df = df.groupby("Datetime", as_index=False)[NUMERIC_COLS_EXPECTED].mean()
+```
+
+이 데이터셋은 `Datetime` 외 컬럼이 모두 숫자형이라 평균 병합이 가능합니다.
+
+주의:
+
+| 상황 | 처리 | 리스크 |
+| --- | --- | --- |
+| 완전 중복 | 제거 | 낮음 |
+| 같은 시각, 거의 같은 값 | 평균 병합 | 낮음 |
+| 같은 시각, 값이 크게 다름 | 평균 병합 가능하지만 report 확인 필요 | 중간~높음 |
+
+`strict=True`에서 충돌 레코드가 critical로 잡힌 경우에는 transform 전에 중단하는 것이 더 안전합니다.
+
+### 4. Time Sorting
+
+`Datetime` 기준으로 정렬합니다.
+
+```python
+df = df.sort_values("Datetime").reset_index(drop=True)
+```
+
+정렬은 이후 `diff()`, `reindex()`, `interpolate()` 결과의 전제 조건입니다.
+
+### 5. 10-Minute Reindexing
+
+전체 기간을 10분 단위 grid로 맞춥니다.
+
+```python
+df = df.set_index("Datetime").sort_index()
+full_index = pd.date_range(df.index.min(), df.index.max(), freq="10min")
+df = df.reindex(full_index)
+df.index.name = "Datetime"
+```
+
+효과:
+
+| reindex 전 | reindex 후 |
+| --- | --- |
+| 누락 시각이 행으로 보이지 않음 | 누락 시각이 `NaN` 행으로 드러남 |
+| 시간 간격 불규칙성을 따로 추적해야 함 | 모든 행이 10분 grid 위에 놓임 |
+| 보간 대상이 불명확할 수 있음 | 보간 대상이 명확해짐 |
+
+원본 데이터는 이미 10분 간격이 완전하지만, 운영 파이프라인에서는 누락 시각을 명시화하기 위해 이 단계를 두는 것이 안전합니다.
+
+### 6. Physical Range Cleaning
+
+validate와 동일한 `VALID_RANGES`를 사용합니다. 범위를 벗어난 값은 삭제하지 않고 `NaN`으로 치환합니다.
+
+```python
+for col, (lo, hi) in VALID_RANGES.items():
+    mask = ~df[col].between(lo, hi)
+    df.loc[mask, col] = np.nan
+```
+
+삭제가 아니라 `NaN` 치환을 선택하는 이유:
+
+| 방식 | 장점 | 단점 |
+| --- | --- | --- |
+| 행 삭제 | 간단함 | 10분 시간축이 깨질 수 있음 |
+| `NaN` 치환 | 시간축 유지, 보간 가능 | 보간 정책 필요 |
+
+시계열 데이터에서는 시간축 보존이 중요하므로 `NaN` 치환이 더 적절합니다.
+
+### 7. Missing Value Interpolation
+
+결측은 시간순 선형 보간으로 처리합니다.
+
+```python
+df[NUMERIC_COLS_EXPECTED] = df[NUMERIC_COLS_EXPECTED].interpolate(
+    method="linear",
+    limit_direction="both",
+)
+```
+
+다만 큰 갭을 무조건 보간하면 실제 전력 패턴을 왜곡할 수 있습니다. 따라서 운영 기준에서는 보간 가능한 연속 결측 길이를 제한하는 편이 좋습니다.
+
+권장 정책:
+
+| 결측 길이 | 처리 |
+| --- | --- |
+| 1~6개 연속 결측, 최대 1시간 | 선형 보간 허용 |
+| 7개 이상 연속 결측 | 자동 보간하지 않고 report 확인 |
+| 하루 단위 누락 | transform 중단 또는 별도 복구 필요 |
+
+구현 예시:
+
+```python
+df[NUMERIC_COLS_EXPECTED] = df[NUMERIC_COLS_EXPECTED].interpolate(
+    method="linear",
+    limit=6,
+    limit_direction="both",
+)
+```
+
+원본 파일에는 결측이 없으므로 이 로직은 주로 향후 다른 입력 파일을 안전하게 처리하기 위한 방어 코드입니다.
+
+### 8. What Transform Does Not Change
+
+아래 항목은 transform에서 수정하지 않습니다.
+
+| 항목 | 이유 |
+| --- | --- |
+| IQR 통계적 이상치 | 정상적인 일중/계절 피크일 수 있음 |
+| 전력 소비 피크 | 실제 수요 패턴일 수 있음 |
+| 일사량의 낮 시간 급증 | 자연스러운 태양광 패턴일 수 있음 |
+| 30분 이상 큰 갭 | 단순 선형 보간으로 왜곡될 수 있음 |
+| 날짜 범위 끝의 `2017-12-31` 부재 | 원본 데이터 범위 자체가 `2017-12-30`까지임 |
+
+특히 `DiffuseFlows`의 IQR 이상치는 밤에는 거의 0, 낮에는 크게 증가하는 분포 때문에 생기는 경우가 많습니다. 오류라고 단정하지 않고 품질 리포트에 남긴 뒤 분석자가 확인하도록 둡니다.
+
+### Transform Summary
+
+validate 항목과 transform 대응 관계는 다음과 같습니다.
+
+| validate 항목 | transform 대응 |
+| --- | --- |
+| 스키마 확인 | 필수 컬럼 없으면 transform 진입 전 중단 |
+| 숫자 타입 검증 | `pd.to_numeric(errors="coerce")` |
+| Datetime 파싱 검증 | `pd.to_datetime(..., errors="coerce")`, `NaT` 행 제거 |
+| 완전 중복 | `drop_duplicates()` |
+| Datetime 중복/충돌 | `groupby("Datetime").mean()` 병합, report 유지 |
+| 시간 정렬 여부 | `sort_values("Datetime")` |
+| 시간 간격 불규칙 | 10분 `date_range`로 `reindex()` |
+| 물리 범위 초과 | `NaN` 치환 |
+| 결측치 | 짧은 구간 선형 보간 |
+| IQR 이상치 | 자동 수정하지 않음 |
+| 큰 시간 갭 | 자동 수정하지 않음, report 확인 |
+
+### Clean Output
+
+정제 후 기대되는 출력 특성:
+
+| 항목 | 기대값 |
+| --- | --- |
+| 행 단위 | 10분 timestamp |
+| 정렬 | `Datetime` 오름차순 |
+| 중복 `Datetime` | 없음 |
+| 수치 컬럼 dtype | numeric |
+| 물리 범위 초과값 | 없음 또는 보간 후 해소 |
+| 짧은 결측 | 보간 완료 |
+| 파생 피처 | 없음 |
+
+최종 저장은 보통 아래 두 형식을 사용합니다.
+
+```text
+powerconsumption_clean.parquet
+powerconsumption_clean.csv
+quality_report.json
+```
