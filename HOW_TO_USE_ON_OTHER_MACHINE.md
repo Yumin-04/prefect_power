@@ -39,6 +39,14 @@ python etl_flow.py --input powerconsumption.csv --outdir ./output
 
 `Finished in state Completed()`가 보이면 성공입니다. `output` 폴더에 정제된 csv/parquet 파일과 품질 리포트(`quality_report.json`)가 생성됩니다.
 
+데이터 품질에 심각한(critical) 문제가 있을 때 파이프라인을 바로 중단시키고 싶다면 `--strict` 옵션을 추가하세요.
+
+```
+python etl_flow.py --input powerconsumption.csv --outdir ./output --strict
+```
+
+> `quality_report.json`에는 결측치/중복/음수값/시간 간격뿐 아니라 물리적으로 불가능한 값, 통계적 이상치(IQR), 컬럼 타입 이상 등도 함께 기록됩니다. 문제는 `critical_issues`(반드시 확인 필요)와 `warnings`(참고용)로 구분되어 있습니다.
+
 ## 6. (선택) Prefect 대시보드로 시각적으로 확인하기
 
 새 명령 프롬프트 창을 열고:

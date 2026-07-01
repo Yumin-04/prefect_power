@@ -21,8 +21,6 @@ Prefect Deployment 등록 스크립트 (예시)
     prefect worker start --pool my-process-pool
 """
 
-from prefect import flow
-
 from etl_flow import power_consumption_etl
 
 
@@ -37,6 +35,9 @@ if __name__ == "__main__":
         parameters={
             "input_path": "powerconsumption.csv",
             "outdir": "./output",
+            # 운영 배치는 strict=True 권장: critical 품질 이슈 발생 시
+            # 잘못된 데이터를 그대로 적재하지 않고 파이프라인을 중단시킴
+            "strict_validation": True,
         },
         tags=["etl", "power-consumption", "kaggle"],
         description="Power Consumption 시계열 데이터 일일 ETL 배치",
