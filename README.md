@@ -1,8 +1,7 @@
-﻿# Power Consumption ETL - Validate & Transform
+﻿# Power Consumption ETL
 
-Kaggle `Power Consumption of Tetouan City` 데이터셋을 분석 가능한 형태로 정제하기 위한 전처리 문서입니다. 이 문서는 파이프라인 전체 설명이 아니라, **validate**와 **transform** 단계만 구체적으로 설명합니다.
-
-이 전처리는 파생 피처 생성(feature engineering)을 하지 않습니다. 시간 변수, lag/rolling, zone 비중, 모델 입력용 스케일링 등은 별도 단계에서 수행하고, 여기서는 원본 데이터의 품질을 검증하고 분석 가능한 시계열 테이블로 정리하는 데 집중합니다.
+Kaggle `Power Consumption of Tetouan City` 데이터셋을 분석 가능한 형태로 정제하기 위한 전처리 문서입니다. 
+시간 변수, lag/rolling, zone 비중, 모델 입력용 스케일링 등은 별도 단계에서 수행하고, 여기서는 원본 데이터의 품질을 검증하고 분석 가능한 시계열 테이블로 정리하는 데 집중합니다.
 
 ## Dataset Grain
 
